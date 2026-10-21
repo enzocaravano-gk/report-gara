@@ -564,6 +564,60 @@
         }
         .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
+        /* ---- ANTEPRIMA PDF ---- */
+        .modal {
+            position: fixed;
+            inset: 0;
+            background: #3a3a3a;
+            display: none;
+            flex-direction: column;
+            z-index: 500;
+        }
+        .modal.open { display: flex; }
+        .modal-bar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 20px;
+            padding-top: max(12px, env(safe-area-inset-top));
+            padding-left: max(20px, env(safe-area-inset-left));
+            padding-right: max(20px, env(safe-area-inset-right));
+            background: #fff;
+            flex-wrap: wrap;
+        }
+        .modal-bar strong { font-size: 17px; margin-right: auto; }
+        .modal-bar .btn { padding: 10px 20px; }
+        .zoom-group { display: inline-flex; border: 1.5px solid var(--accent); border-radius: 40px; overflow: hidden; }
+        .zoom-group button {
+            background: #fff;
+            color: var(--accent);
+            border: none;
+            min-width: 44px;
+            height: 42px;
+            padding: 0 12px;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .zoom-group button + button { border-left: 1px solid rgba(var(--accent-rgb), 0.3); }
+        .modal-body {
+            flex: 1;
+            overflow: auto;
+            -webkit-overflow-scrolling: touch;
+            padding: 20px 16px;
+            padding-bottom: max(20px, env(safe-area-inset-bottom));
+        }
+        /* margin auto (non justify-content) così, quando il foglio
+           ingrandito supera lo schermo, si scorre anche verso sinistra */
+        .modal-body canvas {
+            display: block;
+            margin: 0 auto;
+            height: auto;
+            background: #fff;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+        }
+
         /* ---- ROSTER SQUADRA (finestra) ---- */
         .pl-editor {
             position: fixed;
@@ -687,7 +741,7 @@
 
         /* ---- STYLES PER PDF (applicate con classe .pdf-export) ----
            Il PDF usa un formato pagina calcolato dinamicamente sull'altezza
-           reale del contenuto (vedi exportPdf in JS), quindi qui NON serve
+           reale del contenuto (vedi savePdf in JS), quindi qui NON serve
            schiacciare tutto per farlo stare in una A4 fissa: basta una
            larghezza fissa e coerente, e nascondere gli elementi solo-UI. */
         .app.pdf-export {
@@ -699,9 +753,17 @@
             box-shadow: none !important;
             border: none !important;
         }
+        /* il PDF ha sempre l'impaginazione "da computer", anche se si
+           esporta da telefono: le regole mobile (logo in colonna, riquadro
+           logo alto 300px, "Rosa 26" a capo) qui vanno annullate */
         .app.pdf-export .logo-row {
             margin-bottom: 14px !important;
             padding-bottom: 12px !important;
+            flex-direction: row !important;
+            align-items: center !important;
+        }
+        .app.pdf-export .logo-box {
+            flex: 1 1 auto !important;
         }
         .app.pdf-export .logo-box img {
             max-height: 55px !important;
@@ -715,9 +777,12 @@
         .app.pdf-export h1 {
             font-size: 20px !important;
             margin-bottom: 16px !important;
+            flex-wrap: nowrap !important;
         }
         .app.pdf-export h1 small {
             font-size: 12px !important;
+            margin-left: auto !important;
+            width: auto !important;
         }
         .app.pdf-export .row {
             gap: 8px 10px !important;
@@ -1020,6 +1085,24 @@
                 <button type="button" class="btn btn-primary" id="rosterDoneBtn">Fatto</button>
             </div>
         </div>
+    </div>
+
+    <!-- ANTEPRIMA PDF -->
+    <div class="modal" id="previewModal" aria-hidden="true">
+        <div class="modal-bar">
+            <strong>Anteprima PDF</strong>
+            <div class="zoom-group">
+                <button type="button" id="zoomOutBtn" aria-label="Riduci">−</button>
+                <button type="button" id="zoomFitBtn" title="Adatta alla larghezza">Adatta</button>
+                <button type="button" id="zoomInBtn" aria-label="Ingrandisci">+</button>
+            </div>
+            <button type="button" class="btn btn-outline" id="closePreviewBtn">✕ Chiudi</button>
+            <button type="button" class="btn btn-pdf" id="savePdfBtn">
+                <span class="btn-text">✓ Conferma e salva</span>
+                <span class="spinner"></span>
+            </button>
+        </div>
+        <div class="modal-body" id="modalBody"></div>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -1709,102 +1792,138 @@
                 });
             }
 
-            // ---- ESPORTA PDF (verticale, tutto in una sola pagina) ----
-            // La dimensione della pagina PDF viene calcolata sull'altezza
-            // reale del contenuto (invece di usare una A4 fissa), così il
-            // report sta sempre per intero in un'unica pagina verticale,
-            // qualsiasi sia il numero di righe/note compilate.
-            function exportPdf() {
-                autoSave();
-                const btn = exportBtn;
-                btn.classList.add('loading');
-                btn.disabled = true;
+            // ---- ANTEPRIMA ED ESPORTAZIONE PDF ----
+            // "Esporta PDF" cattura il report una sola volta e lo mostra in
+            // anteprima; "Conferma e salva" crea il PDF da quella stessa
+            // immagine, quindi il file è identico a ciò che si vede. La pagina
+            // è verticale e alta quanto il contenuto: il report sta sempre per
+            // intero in un'unica pagina, qualsiasi sia il numero di righe/note.
+            const CAPTURE_SCALE = 2;
+            const previewModal = document.getElementById('previewModal');
+            const previewBody = document.getElementById('modalBody');
+            const savePdfBtn = document.getElementById('savePdfBtn');
+            let previewCanvas = null;
+            let previewZoom = null;   // null = adatta alla larghezza dello schermo
 
+            function captureReport() {
                 const app = document.getElementById('app');
+                const nextFrame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+                let overlayNodes = [];
                 app.classList.add('pdf-export');
-
-                // Azzera eventuali scroll (pagina e tabella) che
-                // sfaserebbero l'area catturata da html2canvas.
+                // Azzera eventuali scroll (pagina e tabella) che sfaserebbero
+                // l'area catturata da html2canvas.
                 window.scrollTo(0, 0);
-                document.querySelectorAll('.table-wrap').forEach(function(el) {
-                    el.scrollLeft = 0;
-                });
-
-                // Aspetta che il browser applichi il nuovo layout (larghezza
-                // fissa, elementi nascosti) prima di costruire i "gemelli"
-                // di testo e misurare/catturare.
-                requestAnimationFrame(() => {
-                    requestAnimationFrame(() => {
-                        const overlayNodes = buildPrintOverlay(app);
-
-                        // Un ulteriore tick: i div con testo lungo vanno a
-                        // capo su più righe e crescono in altezza, quindi la
-                        // misura dell'altezza va presa DOPO questo reflow.
-                        requestAnimationFrame(() => {
-                            requestAnimationFrame(() => {
-                                const PX_TO_MM = 25.4 / 96;
-
-                                // Dimensioni reali dell'elemento così com'è
-                                // renderizzato, con un margine di sicurezza
-                                // generoso in altezza (le misure del layout
-                                // possono variare leggermente da quelle
-                                // dell'immagine catturata) per evitare che una
-                                // riga finisca tagliata su una seconda pagina.
-                                const rect = app.getBoundingClientRect();
-                                const widthPx = rect.width;
-                                const heightPx = Math.max(rect.height, app.scrollHeight) + 40;
-
-                                const widthMm = widthPx * PX_TO_MM;
-                                const heightMm = heightPx * PX_TO_MM;
-
-                                function finish() {
-                                    removePrintOverlay(app, overlayNodes);
-                                    app.classList.remove('pdf-export');
-                                    btn.classList.remove('loading');
-                                    btn.disabled = false;
-                                }
-
-                                // NON passiamo width/height/windowWidth/windowHeight
-                                // a html2canvas (forzarli causa un disallineamento
-                                // noto della cattura, con contenuto tagliato a
-                                // sinistra). Lasciamo che rilevi da solo l'area
-                                // dell'elemento.
-                                const opt = {
-                                    margin: 0,
-                                    filename: `match-report_${new Date().toISOString().slice(0,10)}.pdf`,
-                                    image: { type: 'jpeg', quality: 0.95 },
-                                    html2canvas: {
-                                        scale: 2,
-                                        useCORS: true,
-                                        logging: false,
-                                        letterRendering: true,
-                                        backgroundColor: '#ffffff',
-                                        scrollX: -window.scrollX,
-                                        scrollY: -window.scrollY,
-                                    },
-                                    jsPDF: {
-                                        unit: 'mm',
-                                        format: [widthMm, heightMm],
-                                        orientation: 'portrait'
-                                    },
-                                    pagebreak: { mode: ['avoid-all'] }
-                                };
-
-                                html2pdf()
-                                    .set(opt)
-                                    .from(app)
-                                    .save()
-                                    .then(finish)
-                                    .catch((err) => {
-                                        console.error('PDF error:', err);
-                                        finish();
-                                        alert('Errore durante la generazione del PDF. Riprova.');
-                                    });
-                            });
-                        });
+                document.querySelectorAll('.table-wrap').forEach(el => { el.scrollLeft = 0; });
+                // Due attese: la prima per applicare il layout PDF prima di
+                // creare i "gemelli" di testo, la seconda perché i testi lunghi
+                // vadano a capo e facciano crescere le righe prima della cattura.
+                // NON passiamo width/height/windowWidth/windowHeight a html2canvas
+                // (forzarli causa un disallineamento noto, con contenuto tagliato
+                // a sinistra): rileva da solo l'area dell'elemento.
+                return nextFrame()
+                    .then(() => { overlayNodes = buildPrintOverlay(app); return nextFrame(); })
+                    .then(() => html2pdf().set({
+                        html2canvas: {
+                            scale: CAPTURE_SCALE,
+                            useCORS: true,
+                            logging: false,
+                            letterRendering: true,
+                            backgroundColor: '#ffffff',
+                            scrollX: -window.scrollX,
+                            scrollY: -window.scrollY
+                        }
+                    }).from(app).toCanvas().get('canvas'))
+                    .finally(() => {
+                        removePrintOverlay(app, overlayNodes);
+                        app.classList.remove('pdf-export');
                     });
-                });
             }
+
+            function fitPreview() {
+                if (!previewCanvas) return;
+                const docWidth = previewCanvas.width / CAPTURE_SCALE;
+                const cs = getComputedStyle(previewBody);
+                const avail = previewBody.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+                const scale = previewZoom == null ? Math.min(1, avail / docWidth) : previewZoom;
+                previewCanvas.style.width = Math.round(docWidth * scale) + 'px';
+                document.getElementById('zoomFitBtn').textContent = Math.round(scale * 100) + '%';
+            }
+            function changeZoom(step) {
+                const cs = getComputedStyle(previewBody);
+                const avail = previewBody.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+                const base = previewZoom == null ? Math.min(1, avail / (previewCanvas.width / CAPTURE_SCALE)) : previewZoom;
+                previewZoom = Math.max(0.25, Math.min(2, Math.round((base + step) * 4) / 4));
+                fitPreview();
+            }
+
+            function openPreview() {
+                if (typeof html2pdf === 'undefined') {
+                    alert('Libreria PDF non caricata. Controlla la connessione e riapri la pagina.');
+                    return;
+                }
+                if (exportBtn.disabled) return;
+                autoSave();
+                exportBtn.classList.add('loading');
+                exportBtn.disabled = true;
+                captureReport()
+                    .then(canvas => {
+                        previewCanvas = canvas;
+                        previewBody.replaceChildren(canvas);
+                        previewModal.classList.add('open');
+                        previewModal.setAttribute('aria-hidden', 'false');
+                        document.body.style.overflow = 'hidden';
+                        previewZoom = null;
+                        fitPreview();
+                        previewBody.scrollTop = 0;
+                    })
+                    .catch(err => {
+                        console.error('Preview error:', err);
+                        alert('Errore durante la preparazione dell\'anteprima. Riprova.');
+                    })
+                    .finally(() => {
+                        exportBtn.classList.remove('loading');
+                        exportBtn.disabled = false;
+                    });
+            }
+            function closePreview() {
+                previewModal.classList.remove('open');
+                previewModal.setAttribute('aria-hidden', 'true');
+                document.body.style.overflow = '';
+            }
+
+            function savePdf() {
+                if (!previewCanvas || savePdfBtn.disabled) return;
+                savePdfBtn.classList.add('loading');
+                savePdfBtn.disabled = true;
+                const PX_TO_MM = 25.4 / 96;
+                const widthMm = previewCanvas.width / CAPTURE_SCALE * PX_TO_MM;
+                // altezza in proporzione esatta all'immagine (+ un soffio contro
+                // gli arrotondamenti), così non nasce mai una seconda pagina
+                const heightMm = widthMm * previewCanvas.height / previewCanvas.width + 0.5;
+                html2pdf().set({
+                    margin: 0,
+                    filename: `match-report_${new Date().toISOString().slice(0, 10)}.pdf`,
+                    image: { type: 'jpeg', quality: 0.95 },
+                    jsPDF: { unit: 'mm', format: [widthMm, heightMm], orientation: 'portrait' }
+                }).from(previewCanvas, 'canvas').save()
+                    .then(closePreview)
+                    .catch(err => {
+                        console.error('PDF error:', err);
+                        alert('Errore durante la generazione del PDF. Riprova.');
+                    })
+                    .then(() => {
+                        savePdfBtn.classList.remove('loading');
+                        savePdfBtn.disabled = false;
+                    });
+            }
+
+            document.getElementById('zoomInBtn').addEventListener('click', () => changeZoom(0.25));
+            document.getElementById('zoomOutBtn').addEventListener('click', () => changeZoom(-0.25));
+            document.getElementById('zoomFitBtn').addEventListener('click', () => { previewZoom = null; fitPreview(); });
+            document.getElementById('closePreviewBtn').addEventListener('click', closePreview);
+            savePdfBtn.addEventListener('click', savePdf);
+            previewBody.addEventListener('click', (e) => { if (e.target === previewBody) closePreview(); });
+            window.addEventListener('resize', () => { if (previewModal.classList.contains('open')) fitPreview(); });
 
             // ---- AVVISO TEMPORANEO ----
             let toastTimer = null;
@@ -2084,7 +2203,7 @@
 
             clearBtn.addEventListener('click', clearFormation);
             resetBtn.addEventListener('click', resetAll);
-            exportBtn.addEventListener('click', exportPdf);
+            exportBtn.addEventListener('click', openPreview);
 
             // ---- INIT ----
             const loaded = loadState();
@@ -2107,9 +2226,11 @@
             // Ctrl+Enter per esportare
             document.addEventListener('keydown', function(e) {
                 if (e.key === 'Escape' && rosterModal.classList.contains('open')) { closeRoster(); return; }
+                if (e.key === 'Escape' && previewModal.classList.contains('open')) { closePreview(); return; }
                 if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
                     e.preventDefault();
-                    exportPdf();
+                    if (previewModal.classList.contains('open')) savePdf();
+                    else openPreview();
                 }
             });
 
